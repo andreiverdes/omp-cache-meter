@@ -1,0 +1,6 @@
+schema = 1
+id = "cache-meter"
+name = "Prompt-cache meter"
+version = "0.1.0-beta01"
+description = "Countdown to each omp agent's prompt-cache expiry in the status line and tab titles, an expiry toast, and an all-agents canvas. Reads the state the omp cache-meter extension publishes."
+window = "window.luau"
