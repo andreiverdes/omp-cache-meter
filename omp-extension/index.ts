@@ -54,6 +54,7 @@ export default function cacheMeter(pi: ExtensionAPI): void {
 			const at = Date.parse(e.timestamp);
 			if (e.type === "message" && e.message.role === "assistant" && e.message.usage) tracker.record("turn", e.message.usage, at, model);
 			else if (e.type === "model_usage" && e.purpose.startsWith("cache-warm")) tracker.record("warm", e.usage, at, model);
+			else if (e.type === "compaction") tracker.compacted = { at, tokensBefore: e.tokensBefore, tokensAfter: e.tokensAfter };
 		}
 		published = "";
 	};
@@ -78,6 +79,7 @@ export default function cacheMeter(pi: ExtensionAPI): void {
 			coldAdvice: s.coldAdvice,
 			last: { read: s.last.read, write: s.last.write, uncached: s.last.uncached, total: s.last.total, hitPct: s.last.hitPct },
 			warming: s.warming,
+			compacted: s.compacted,
 			totals: tracker.totals,
 			history: tracker.history.slice(-20).map(r => ({ kind: r.kind, hitPct: (100 * r.read) / (r.read + r.write + r.uncached) })),
 		};
@@ -94,7 +96,7 @@ export default function cacheMeter(pi: ExtensionAPI): void {
 		if (!ui) return;
 		const s = snapshot(tracker, env());
 		const show = settings.meter.show;
-		const want = s !== undefined && show !== "off" && !(show === "near-expiry" && s.stage === "warm");
+		const want = s !== undefined && show !== "off" && !(show === "near-expiry" && (s.stage === "warm" || s.stage === "compacted"));
 		if (want && !meterShown) {
 			// Lines are rebuilt on every paint so the countdown moves; describe() feeds native hosts (Tern).
 			const lines = (): { lines: Line[]; tone: Tone } => {
@@ -188,6 +190,14 @@ export default function cacheMeter(pi: ExtensionAPI): void {
 	pi.on("cache_warming_end", e => {
 		if (e.usage) tracker.record("warm", e.usage, Date.now(), model);
 		if (e.warmingStopReason) tracker.stopped = { at: Date.now(), reason: e.warmingStopReason };
+		refresh();
+	});
+
+	// /compact replaces the conversation, so the cached prefix stops mattering: the meter switches to the
+	// compacted state until the next turn writes the new prefix.
+	pi.on("session_compact", e => {
+		const c = e.compactionEntry;
+		tracker.compacted = { at: Date.parse(c.timestamp) || Date.now(), tokensBefore: c.tokensBefore, tokensAfter: c.tokensAfter };
 		refresh();
 	});
 

@@ -42,6 +42,7 @@ The meter sits above the composer and redraws every second. Its colour and text 
 | Warm | More than the warning time left, or omp will refresh the cache in time | Hit %, token split, countdown, tier, the planned refresh, `✓ keep going` |
 | Expiring | Inside the warning time (default 60 s) with no refresh planned | `⚠ expires in`, what the next turn would rewrite and cost, why omp won't warm it |
 | Cold | The cache entry has expired | The rewrite cost and three ways on: `/compact`, `/new`, keep going |
+| Reset by `/compact` | A compaction (manual or automatic) is newer than the last request | Tokens before → after, what the next request writes for the new prefix, `✓ keep going` |
 
 ![The meter on an expiring cache: send now to keep it, or the next turn rewrites the prefix](docs/screenshots/omp-meter-expiring.png)
 
@@ -92,6 +93,7 @@ All colours come from the active omp or Tern theme, so light and dark themes bot
 ## How it works
 
 - **Usage:** the extension records each assistant message's usage on `message_end`. On session start it rebuilds history from the session branch, including warming refreshes stored as `model_usage` entries, so a resumed session shows its real countdown.
+- **Compaction:** on `session_compact` (and for compaction entries when it rebuilds) the meter drops the old countdown: the summary replaces the conversation, so the cached prefix is never read again. The first turn after it is labelled `after /compact` in the panel instead of being counted as a miss.
 - **Cache lifetime:** the tier comes from the `cache_control.ttl` on the request omp sends (`before_provider_request`), confirmed by Anthropic's cache-write split in the usage. The lifetime of that tier comes from the model's `promptCache` entry in omp's catalog.
 - **Warming:** omp doesn't expose its warmer's state to extensions, so the extension mirrors omp's rules from `cache-warmer.ts`. A refresh is scheduled at 90% of the lifetime and at least 10 s before expiry. Idle warming stops 30 minutes after the last request, so it covers 5m entries only. Any `cache_warming_decision` and `cache_warming_end` events refine that.
 - **State file:** the interactive session writes `<Tern config>/plugin-data/cache-meter/panes/<TERN_PANE>.json` atomically whenever its contents change, and deletes it on exit. Subagent and print-mode sessions have no UI and never write it.

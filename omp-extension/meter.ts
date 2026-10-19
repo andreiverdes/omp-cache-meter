@@ -4,7 +4,8 @@ import type { MeterSettings } from "./settings";
 export type Tier = "short" | "long";
 export type WarmingMode = "off" | "streaming" | "idle";
 export type Retention = "auto" | "short" | "long" | "none";
-export type Stage = "warm" | "expiring" | "cold";
+/** `compacted`: /compact replaced the conversation after the last request, so the cached prefix is no longer used. */
+export type Stage = "warm" | "expiring" | "cold" | "compacted";
 
 export interface Req {
 	at: number;
@@ -13,6 +14,8 @@ export interface Req {
 	write: number;
 	uncached: number;
 	cost: number;
+	/** The first turn after a compaction: its cache write is the new prefix, not a miss. */
+	afterCompact?: true;
 }
 
 /** USD per token. */
@@ -37,6 +40,8 @@ export class Tracker {
 	/** Last warming decision or stop omp reported, with when it happened. */
 	decision: { at: number; action: "warm" | "stop"; warmCost: number; missCost: number } | undefined;
 	stopped: { at: number; reason: string } | undefined;
+	/** The latest compaction, until the next turn sends the new prefix. */
+	compacted: { at: number; tokensBefore: number; tokensAfter: number | undefined } | undefined;
 
 	reset(): void {
 		this.history = [];
@@ -44,6 +49,7 @@ export class Tracker {
 		this.observedTier = undefined;
 		this.decision = undefined;
 		this.stopped = undefined;
+		this.compacted = undefined;
 	}
 
 	/** Adds one request; returns false when it carried no prompt tokens (errors, aborts). */
@@ -58,7 +64,10 @@ export class Tracker {
 			this.totals.warms++;
 			this.totals.warmCost += r.cost;
 		}
-		if (this.history.length > 0 && r.read === 0 && r.write > 0) {
+		if (kind === "turn" && this.compacted) {
+			r.afterCompact = true;
+			this.compacted = undefined;
+		} else if (this.history.length > 0 && r.read === 0 && r.write > 0) {
 			this.totals.misses++;
 			this.totals.missCost += r.write * price.write;
 		}
@@ -107,6 +116,7 @@ export interface Env {
 /** Everything the meter, the panel and Tern show; time-dependent fields are computed from `now`. */
 export interface Snapshot {
 	last: Req & { total: number; hitPct: number };
+	/** The prefix the next request sends: the last request's prompt, or the compacted context after /compact. */
 	prefixTokens: number;
 	tier: Tier;
 	tierSource: "observed" | "assumed";
@@ -120,6 +130,8 @@ export interface Snapshot {
 	warming: { scheduled: boolean; nextWarmAt: number | undefined; summary: string };
 	stage: Stage;
 	advice: "keep going" | "send now" | "compact";
+	/** Set while a compaction is newer than the last request; `tokensAfter` is omp's estimate when it has one. */
+	compacted: { tokensBefore: number; tokensAfter: number | undefined } | undefined;
 	cachingOff: boolean;
 }
 
@@ -139,7 +151,10 @@ export function snapshot(t: Tracker, env: Env): Snapshot | undefined {
 	const ttlMs = (declared ?? (tier === "long" ? 3600 : 300)) * 1000;
 	const expiresAt = last.at + ttlMs;
 	const leftMs = expiresAt - env.now;
-	const rewriteCost = total * priceOf(env.model, tier).write;
+	// After /compact the next request sends the summary instead of the cached conversation: a new prefix.
+	const compacted = t.compacted && t.compacted.at >= last.at ? t.compacted : undefined;
+	const prefixTokens = compacted ? (compacted.tokensAfter ?? 0) : total;
+	const rewriteCost = prefixTokens * priceOf(env.model, tier).write;
 
 	// Mirror of omp's warmer rules (cache-warmer.ts); omp does not expose its live status to extensions.
 	const delay = warmDelayMs(ttlMs);
@@ -155,28 +170,28 @@ export function snapshot(t: Tracker, env: Env): Snapshot | undefined {
 	} else if (env.warmingMode === "streaming") reason = "streaming mode stops when idle";
 	else if (delay !== undefined && delay >= IDLE_WINDOW_MS) reason = "idle warming covers 5m entries only";
 	else if (nextWarmAt > last.at + IDLE_WINDOW_MS) reason = "past the 30 min idle window";
-	const scheduled = reason === undefined && nextWarmAt !== undefined && nextWarmAt > env.now;
+	const scheduled = reason === undefined && !compacted && nextWarmAt !== undefined && nextWarmAt > env.now;
 	let summary: string;
 	if (scheduled && delay !== undefined) {
 		summary = `warming at ${clock((ttlMs - delay) / 1000)} left`;
 		const d = t.decision;
 		if (d && d.at >= last.at) summary += ` · refresh $${d.warmCost.toFixed(2)} vs miss $${d.missCost.toFixed(2)}`;
 	} else {
-		summary = `not warmed: ${reason ?? "refresh window passed"}`;
+		summary = compacted ? "old prefix dropped by /compact" : `not warmed: ${reason ?? "refresh window passed"}`;
 	}
 
 	const { rule, tokenThreshold, dollarThreshold } = env.settings.advice;
-	const byTokens = tokenThreshold > 0 && total >= tokenThreshold;
+	const byTokens = tokenThreshold > 0 && prefixTokens >= tokenThreshold;
 	const byDollars = dollarThreshold > 0 && rewriteCost >= dollarThreshold;
 	const compact = rule === "tokens" ? byTokens : rule === "dollars" ? byDollars : byTokens || byDollars;
 	const coldAdvice = compact ? "compact" : "keep going";
 
 	const leadMs = env.settings.meter.warnLeadSeconds * 1000;
-	const stage: Stage = leftMs <= 0 ? "cold" : leftMs <= leadMs && !scheduled ? "expiring" : "warm";
+	const stage: Stage = compacted ? "compacted" : leftMs <= 0 ? "cold" : leftMs <= leadMs && !scheduled ? "expiring" : "warm";
 	const advice = stage === "cold" ? coldAdvice : stage === "expiring" ? "send now" : "keep going";
 	return {
 		last: { ...last, total, hitPct: total > 0 ? (100 * last.read) / total : 0 },
-		prefixTokens: total,
+		prefixTokens,
 		tier,
 		tierSource: known ? "observed" : "assumed",
 		tierLabel: `${tier === "long" ? "1h" : "5m"} tier${known ? "" : " (assumed)"}`,
@@ -188,6 +203,7 @@ export function snapshot(t: Tracker, env: Env): Snapshot | undefined {
 		warming: { scheduled, nextWarmAt, summary },
 		stage,
 		advice,
+		compacted: compacted && { tokensBefore: compacted.tokensBefore, tokensAfter: compacted.tokensAfter },
 		cachingOff: env.retention === "none",
 	};
 }
@@ -236,25 +252,36 @@ function bar(cells: number, parts: [number, Tone][]): Group {
 
 /** The colour of a stage: the meter's edge, countdown and advice. */
 export function stageTone(stage: Stage): Tone {
-	return stage === "cold" ? "error" : stage === "expiring" ? "warning" : "success";
+	return stage === "cold" ? "error" : stage === "expiring" ? "warning" : stage === "compacted" ? "accent" : "success";
 }
 
 /** The 0–3 line meter above the composer; empty when settings hide it now. */
 export function renderMeter(s: Snapshot, settings: MeterSettings): Line[] {
 	const show = settings.meter.show;
-	if (show === "off" || (show === "near-expiry" && s.stage === "warm")) return [];
+	if (show === "off" || (show === "near-expiry" && (s.stage === "warm" || s.stage === "compacted"))) return [];
 	if (s.cachingOff) return [[[{ text: "prompt caching off · providers.cacheRetention: none", tone: "muted" }]]];
 	const tone = stageTone(s.stage);
 	const left = clock(s.leftMs / 1000);
 	const cost = `$${s.rewriteCost.toFixed(2)}`;
 	const rewrite = `${tokens(s.prefixTokens)} tokens ≈ ${cost}`;
 
+	if (s.compacted) {
+		const after = s.compacted.tokensAfter;
+		if (settings.meter.size === "compact") return [[[{ text: `⛁ cache reset by /compact${after === undefined ? "" : ` · new prefix ≈ ${cost}`}`, tone }], [{ text: "✓ keep going", tone }]]];
+		const sizes = after === undefined ? `was ${tokens(s.compacted.tokensBefore)} tokens` : `${tokens(s.compacted.tokensBefore)} → ${tokens(after)} tokens`;
+		const next: Group = [{ text: "next request writes the new prefix", tone: "muted" }];
+		if (after !== undefined) next.push({ text: " " }, { text: rewrite });
+		return [
+			[[{ text: "⛁ prompt cache reset by /compact", tone }], [{ text: sizes, tone: "muted" }]],
+			[next, [{ text: "✓ keep going", tone: "success" }]],
+		];
+	}
+
 	if (settings.meter.size === "compact") {
 		const head = s.stage === "cold" ? `⛁ cache cold · rewrite ≈ ${cost}` : `⛁ ${s.last.hitPct.toFixed(1)}% hit · ${left}`;
 		const advice = s.advice === "compact" ? "→ /compact" : s.advice === "send now" ? "→ send now" : "✓ keep going";
 		return [[[{ text: head, tone }], [{ text: advice, tone }]]];
 	}
-
 	if (s.stage === "cold") {
 		const options: Line = [];
 		if (s.coldAdvice === "compact") options.push([{ text: "/compact", tone: "accent" }, { text: " shrink first (recommended)", tone: "muted" }]);
@@ -315,7 +342,7 @@ export function renderPanel(t: Tracker, s: Snapshot | undefined, model: Model | 
 	let turn = t.history.filter(r => r.kind === "turn").length - recent.filter(r => r.kind === "turn").length;
 	for (const [i, r] of recent.entries()) {
 		const total = r.read + r.write + r.uncached;
-		const miss = (i > 0 || t.history.length > recent.length) && r.read === 0 && r.write > 0;
+		const miss = !r.afterCompact && (i > 0 || t.history.length > recent.length) && r.read === 0 && r.write > 0;
 		const row: Group = [
 			col(new Date(r.at).toTimeString().slice(0, 8), 10, false),
 			r.kind === "warm" ? { text: "warm".padEnd(11), tone: "accent" } : col(`turn ${++turn}`, 11, false),
@@ -327,7 +354,8 @@ export function renderPanel(t: Tracker, s: Snapshot | undefined, model: Model | 
 			{ text: `${((100 * r.read) / total).toFixed(1)}%`.padStart(8), tone: r.read / total >= 0.9 ? undefined : "warning" },
 			col(`$${r.cost.toFixed(2)}`, 9),
 		];
-		if (miss) row.push({ text: "   miss", tone: "error" });
+		if (r.afterCompact) row.push({ text: "   after /compact", tone: "accent" });
+		else if (miss) row.push({ text: "   miss", tone: "error" });
 		rows.push([row]);
 	}
 	const footer: Line = ["/cache closes", "/cache settings", "/compact", "/new"].map(text => [{ text, tone: "muted" }]);

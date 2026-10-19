@@ -45,10 +45,19 @@ export interface ExtensionUI {
 	notify(message: string, level?: "info" | "warning" | "error"): void;
 }
 
+/** A compaction: the conversation was replaced by a summary, so the next request sends a new prefix. */
+export interface CompactionEntry {
+	type: "compaction";
+	timestamp: string;
+	tokensBefore: number;
+	tokensAfter?: number;
+}
+
 export type SessionEntry =
 	| { type: "message"; timestamp: string; message: { role: string; provider?: string; model?: string; usage?: Usage } }
 	| { type: "model_usage"; timestamp: string; purpose: string; provider: string; model: string; usage: Usage }
-	| { type: "compaction" | "custom" | "custom_message" | "branch_summary" | "model_change"; timestamp: string };
+	| CompactionEntry
+	| { type: "custom" | "custom_message" | "branch_summary" | "model_change"; timestamp: string };
 
 export interface ExtensionContext {
 	ui: ExtensionUI;
@@ -96,5 +105,6 @@ export interface ExtensionAPI {
 	on(event: "before_provider_request", handler: Handler<{ payload: unknown }>): void;
 	on(event: "cache_warming_decision", handler: Handler<CacheWarmingDecisionEvent>): void;
 	on(event: "cache_warming_end", handler: Handler<CacheWarmingEndEvent>): void;
+	on(event: "session_compact", handler: Handler<{ compactionEntry: CompactionEntry }>): void;
 	registerCommand(name: string, def: CommandDef): void;
 }

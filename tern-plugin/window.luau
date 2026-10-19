@@ -64,17 +64,18 @@ local function tokens(n)
 	return tostring(math.floor(n))
 end
 
--- The same stages and advice the omp meter shows: warm, expiring (inside the warn lead and no refresh
--- planned) or cold.
+-- The same stages and advice the omp meter shows: compacted (/compact dropped the cached prefix), warm,
+-- expiring (inside the warn lead and no refresh planned) or cold.
 local function stage(s)
 	local left = s.expiresAt - now_ms()
+	if s.compacted then return "compacted", left, "keep going" end
 	local planned = s.warming.scheduled and s.warming.nextWarmAt ~= nil and s.warming.nextWarmAt > now_ms()
 	if left <= 0 then return "cold", left, s.coldAdvice end
 	if left <= s.warnLeadSeconds * 1000 and not planned then return "expiring", left, "send now" end
 	return "warm", left, "keep going"
 end
 
-local TONE = { warm = "success", expiring = "warning", cold = "error" }
+local TONE = { warm = "success", expiring = "warning", cold = "error", compacted = "accent" }
 
 local function load(cx)
 	local live = {}
@@ -125,6 +126,8 @@ tern.chrome.status(function(p)
 	local text
 	if st == "cold" then
 		text = "cache cold"
+	elseif st == "compacted" then
+		text = "cache reset by /compact"
 	elseif settings.segment.format == "countdown" then
 		text = clock(left / 1000)
 	else
@@ -145,8 +148,9 @@ tern.chrome.tab_title(function(tab)
 	local s = pane and state[pane]
 	if not s then return nil end
 	local st, left = stage(s)
-	if settings.tabs.when == "near-expiry" and st == "warm" then return nil end
-	return string.format("%s ⛁ %s", tab.name or tab.title, if st == "cold" then "cold" else clock(left / 1000))
+	if settings.tabs.when == "near-expiry" and (st == "warm" or st == "compacted") then return nil end
+	local suffix = if st == "cold" then "cold" elseif st == "compacted" then "compacted" else clock(left / 1000)
+	return string.format("%s ⛁ %s", tab.name or tab.title, suffix)
 end)
 
 -- A clickable button styled like omp's TSP buttons; `act` may carry a value after `=`.
@@ -180,8 +184,9 @@ local function main_view()
 				tokens(s.prefixTokens),
 				if st == "cold"
 					then ui.span("cold " .. clock(-left / 1000) .. " ago", "error")
+					elseif st == "compacted" then ui.span("reset by /compact", "accent")
 					else { meter = { value = left / s.ttlMs, tone = TONE[st] } },
-				ui.span(if st == "cold" then "" else clock(left / 1000) .. " · " .. s.tierLabel, "muted"),
+				ui.span(if st == "cold" or st == "compacted" then "" else clock(left / 1000) .. " · " .. s.tierLabel, "muted"),
 				ui.span(s.warming.summary, "muted"),
 				ui.span(advice, TONE[st]),
 			})
@@ -378,39 +383,68 @@ tern.on("focus", function(ev, _cx)
 	if state[ev.pane] then last_agent = ev.pane end
 end)
 
-local function tick(cx)
-	if cx then
-		local ok, err = pcall(function()
-			load_settings()
-			load(cx)
-			local focused = cx.session:focused()
-			if focused and state[focused] then last_agent = focused end
-			if settings.toast.show then
-				for pane, s in state do
-					local st, left = stage(s)
-					local planned = s.warming.scheduled and s.warming.nextWarmAt ~= nil and s.warming.nextWarmAt > now_ms()
-					local due = st ~= "cold" and left <= settings.toast.leadSeconds * 1000
-					local skip = (settings.toast.skipFocused and pane == focused) or (settings.toast.skipWarmed and planned)
-					if due and not skip and warned[pane] ~= s.expiresAt then
-						warned[pane] = s.expiresAt
-						cx:toast(
-							"info",
-							string.format("%s · prompt cache expires in %d s", s.label, math.ceil(left / 1000)),
-							string.format("%s-token prefix · next turn rewrites ≈ $%.2f · %s", tokens(s.prefixTokens), s.rewriteCost, s.warming.summary)
-						)
-					end
+local function work(cx)
+	local ok, err = pcall(function()
+		load_settings()
+		load(cx)
+		local focused = cx.session:focused()
+		if focused and state[focused] then last_agent = focused end
+		if settings.toast.show then
+			for pane, s in state do
+				local st, left = stage(s)
+				local planned = s.warming.scheduled and s.warming.nextWarmAt ~= nil and s.warming.nextWarmAt > now_ms()
+				local due = (st == "warm" or st == "expiring") and left <= settings.toast.leadSeconds * 1000
+				local skip = (settings.toast.skipFocused and pane == focused) or (settings.toast.skipWarmed and planned)
+				if due and not skip and warned[pane] ~= s.expiresAt then
+					warned[pane] = s.expiresAt
+					cx:toast(
+						"info",
+						string.format("%s · prompt cache expires in %d s", s.label, math.ceil(left / 1000)),
+						string.format("%s-token prefix · next turn rewrites ≈ $%.2f · %s", tokens(s.prefixTokens), s.rewriteCost, s.warming.summary)
+					)
 				end
 			end
-			ticks += 1
-			if is_open(cx, main_canvas) and ticks % math.max(1, math.floor(settings.canvas.refreshSeconds)) == 0 then
-				cx.canvas:set(main_canvas, { view = main_view() })
-			end
-			tern.chrome.refresh()
-		end)
-		if not ok then tern.log.warn("cache-meter:", err) end
-	end
-	tern.timer(1000, tick)
+		end
+		ticks += 1
+		if is_open(cx, main_canvas) and ticks % math.max(1, math.floor(settings.canvas.refreshSeconds)) == 0 then
+			cx.canvas:set(main_canvas, { view = main_view() })
+		end
+		tern.chrome.refresh()
+	end)
+	if not ok then tern.log.warn("cache-meter:", err) end
+end
+
+-- Tern stops a plugin's timers for good once one callback runs past its 50 ms budget, and pcall can't catch
+-- that. Right after the machine wakes everything is slow, so the first ticks after a wall-clock jump only
+-- re-arm. If a timer still trips, a slower watchdog on Tern's separate `await` budget takes the ticks over.
+local SETTLE_MS = 3000
+local last_tick, last_wall, settle_until = tern.now(), os.time(), 0
+
+local function tick(cx, rearm)
+	rearm()
+	if not cx then return end
+	local wall = os.time()
+	if wall - last_wall > 5 then settle_until = tern.now() + SETTLE_MS end
+	last_wall, last_tick = wall, tern.now()
+	if last_tick >= settle_until then work(cx) end
+end
+
+local function by_sleep(cx)
+	tick(cx, function()
+		tern.sleep(1000):next(function(_, _, next_cx) by_sleep(next_cx) end)
+	end)
+end
+
+local function by_timer(cx)
+	tick(cx, function() tern.timer(1000, by_timer) end)
+end
+
+local function watchdog()
+	tern.sleep(5000):next(function(_, _, cx)
+		if tern.now() - last_tick > 5000 then by_sleep(cx) else watchdog() end
+	end)
 end
 
 load_settings()
-tick(nil)
+by_timer(nil)
+watchdog()
