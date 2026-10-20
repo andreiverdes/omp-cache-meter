@@ -127,7 +127,8 @@ export interface Snapshot {
 	leftMs: number;
 	rewriteCost: number;
 	coldAdvice: "compact" | "keep going";
-	warming: { scheduled: boolean; nextWarmAt: number | undefined; summary: string };
+	/** `reason` says, in plain words, why no refresh is planned; undefined while one is. */
+	warming: { scheduled: boolean; nextWarmAt: number | undefined; summary: string; reason: string | undefined };
 	stage: Stage;
 	advice: "keep going" | "send now" | "compact";
 	/** Set while a compaction is newer than the last request; `tokensAfter` is omp's estimate when it has one. */
@@ -160,24 +161,26 @@ export function snapshot(t: Tracker, env: Env): Snapshot | undefined {
 	const delay = warmDelayMs(ttlMs);
 	const nextWarmAt = delay === undefined ? undefined : last.at + delay;
 	let reason: string | undefined;
-	if (env.retention === "none") reason = "prompt caching off";
-	else if (env.warmingMode === "off") reason = "warming off";
-	else if (declared === undefined || nextWarmAt === undefined) reason = "model declares no cache lifetime";
+	if (env.retention === "none") reason = "prompt caching is off";
+	else if (env.warmingMode === "off") reason = "cache warming is off in /settings";
+	else if (declared === undefined || nextWarmAt === undefined) reason = "the model declares no cache lifetime";
 	else if (t.stopped && t.stopped.at >= last.at) reason = t.stopped.reason;
-	else if (t.decision && t.decision.at >= last.at && t.decision.action === "stop") reason = "refresh not worth it";
+	else if (t.decision && t.decision.at >= last.at && t.decision.action === "stop") reason = "omp judged a refresh not worth it";
 	else if (env.agentRunning) {
-		if (nextWarmAt > last.at + RUN_LIMIT_MS) reason = "past the 1 h limit";
-	} else if (env.warmingMode === "streaming") reason = "streaming mode stops when idle";
-	else if (delay !== undefined && delay >= IDLE_WINDOW_MS) reason = "idle warming covers 5m entries only";
-	else if (nextWarmAt > last.at + IDLE_WINDOW_MS) reason = "past the 30 min idle window";
+		if (nextWarmAt > last.at + RUN_LIMIT_MS) reason = "past omp's 1 h refresh limit";
+	} else if (env.warmingMode === "streaming") reason = "streaming warming stops when you go idle";
+	else if (delay !== undefined && delay >= IDLE_WINDOW_MS) reason = "omp only refreshes 5m caches while idle, and this one is 1h";
+	else if (nextWarmAt > last.at + IDLE_WINDOW_MS) reason = "omp stops refreshing 30 min after your last message";
 	const scheduled = reason === undefined && !compacted && nextWarmAt !== undefined && nextWarmAt > env.now;
+	// No rule fired but the refresh time passed: after refreshes, the 30 min idle limit; otherwise omp never got to it.
+	if (!scheduled && reason === undefined) reason = last.kind === "warm" ? "omp stops refreshing 30 min after your last message" : "no refresh ran in time";
 	let summary: string;
 	if (scheduled && delay !== undefined) {
 		summary = `warming at ${clock((ttlMs - delay) / 1000)} left`;
 		const d = t.decision;
 		if (d && d.at >= last.at) summary += ` · refresh $${d.warmCost.toFixed(2)} vs miss $${d.missCost.toFixed(2)}`;
 	} else {
-		summary = compacted ? "old prefix dropped by /compact" : `not warmed: ${reason ?? "refresh window passed"}`;
+		summary = compacted ? "old prefix dropped by /compact" : `not warmed: ${reason}`;
 	}
 
 	const { rule, tokenThreshold, dollarThreshold } = env.settings.advice;
@@ -200,7 +203,7 @@ export function snapshot(t: Tracker, env: Env): Snapshot | undefined {
 		leftMs,
 		rewriteCost,
 		coldAdvice,
-		warming: { scheduled, nextWarmAt, summary },
+		warming: { scheduled, nextWarmAt, summary, reason: scheduled ? undefined : reason },
 		stage,
 		advice,
 		compacted: compacted && { tokensBefore: compacted.tokensBefore, tokensAfter: compacted.tokensAfter },
@@ -230,6 +233,14 @@ export function tokens(n: number): string {
 export function clock(seconds: number): string {
 	const s = Math.max(0, Math.ceil(seconds));
 	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** A past span: `4:12` under an hour, then `3h 05m`, then `2d 4h`. */
+export function elapsed(seconds: number): string {
+	const s = Math.max(0, Math.floor(seconds));
+	if (s < 3600) return clock(s);
+	if (s < 86_400) return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+	return `${Math.floor(s / 86_400)}d ${Math.floor((s % 86_400) / 3600)}h`;
 }
 
 const GAP = "   "; // between groups on a line
@@ -283,14 +294,21 @@ export function renderMeter(s: Snapshot, settings: MeterSettings): Line[] {
 		return [[[{ text: head, tone }], [{ text: advice, tone }]]];
 	}
 	if (s.stage === "cold") {
-		const options: Line = [];
-		if (s.coldAdvice === "compact") options.push([{ text: "/compact", tone: "accent" }, { text: " shrink first (recommended)", tone: "muted" }]);
-		options.push([{ text: "/new", tone: "accent" }, { text: " task done", tone: "muted" }]);
-		options.push([{ text: "keep going", tone: "accent" }, { text: ` pay ${cost} once${s.coldAdvice === "keep going" ? " (recommended)" : ""}`, tone: "muted" }]);
+		// One line per way on, command column aligned, so each choice reads on its own. The padding is
+		// non-breaking because native hosts trim trailing spaces from a text node.
+		const option = (cmd: string, what: string, recommended: boolean): Line => {
+			const line: Line = [[{ text: cmd.padEnd(10, "\u00a0"), tone: "accent" }], [{ text: what, tone: "muted" }]];
+			if (recommended) line.push([{ text: "← recommended", tone: "success" }]);
+			return line;
+		};
+		const compact = s.coldAdvice === "compact";
 		return [
-			[[{ text: "✕ prompt cache cold", tone: "error" }], [{ text: `expired ${clock(-s.leftMs / 1000)} ago`, tone: "muted" }], [{ text: "next request rewrites " , tone: "muted" }, { text: rewrite }]],
-			options,
-			[[{ text: s.warming.summary, tone: "muted" }], [{ text: "thresholds: /cache settings", tone: "muted" }]],
+			[[{ text: "✕ prompt cache cold", tone: "error" }], [{ text: `expired ${elapsed(-s.leftMs / 1000)} ago`, tone: "muted" }]],
+			[[{ text: "your next message re-sends ", tone: "muted" }, { text: rewrite }, { text: " to rebuild it", tone: "muted" }]],
+			option("keep going", `send as usual; pay ${cost} once, then it's cached again`, !compact),
+			option("/compact", "summarise first; later turns send far fewer tokens", compact),
+			option("/new", "fresh session; best when this task is finished", false),
+			[[{ text: `why it went cold: ${s.warming.reason ?? "the cache expired"}`, tone: "muted" }], [{ text: "· /cache settings sets when /compact is recommended", tone: "muted" }]],
 		];
 	}
 

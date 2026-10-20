@@ -41,16 +41,27 @@ The meter sits above the composer and redraws every second. Its colour and text 
 |---|---|---|
 | Warm | More than the warning time left, or omp will refresh the cache in time | Hit %, token split, countdown, tier, the planned refresh, `✓ keep going` |
 | Expiring | Inside the warning time (default 60 s) with no refresh planned | `⚠ expires in`, what the next turn would rewrite and cost, why omp won't warm it |
-| Cold | The cache entry has expired | The rewrite cost and three ways on: `/compact`, `/new`, keep going |
+| Cold | The cache entry has expired | How long ago, what your next message re-sends and costs, one line per way on (below), and why it went cold |
 | Reset by `/compact` | A compaction (manual or automatic) is newer than the last request | Tokens before → after, what the next request writes for the new prefix, `✓ keep going` |
 
 ![The meter on an expiring cache: send now to keep it, or the next turn rewrites the prefix](docs/screenshots/omp-meter-expiring.png)
 
-![The meter on a cold cache, recommending /compact](docs/screenshots/omp-meter-cold.png)
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/omp-meter-cold-light.png">
+  <img alt="The meter on a cold cache: expired 1:44 ago, the rewrite cost, then keep going, /compact (recommended) and /new on separate lines with what each does, and why it went cold" src="docs/screenshots/omp-meter-cold.png">
+</picture>
 
-(For the cold screenshot the token threshold was lowered to 20,000 so the 31k-token demo prefix passes it.)
+(For the cold screenshot the token threshold was lowered to 20,000 so the 30.7k-token demo prefix passes it.)
 
-On a cold cache the meter recommends `/compact` when the prefix passes a token threshold, the rewrite passes a dollar threshold, or either one (the default). Compacting still reads the cold prefix once. What it saves is the cost of every later turn and of the next expiry.
+On a cold cache your next message has to re-send the whole conversation to rebuild the cache. The meter lists three ways on, one per line, and marks one as recommended:
+
+| Option | What it does | When to pick it |
+|---|---|---|
+| keep going | Send your next message as usual. It pays the rewrite once, then the cache is warm again. | Small or mid-sized conversations, or when you need the full history. |
+| `/compact` | omp summarises the conversation, and later turns send the summary instead of the full history. | Large conversations. The summary request reads the old history once more, but every turn after it, and every later expiry, costs less. |
+| `/new` | Starts a fresh session with nothing to rebuild. | The task you were on is finished. |
+
+`/compact` is recommended when the prefix passes a token threshold, the rewrite passes a dollar threshold, or either one (the default); otherwise keep going is. The thresholds are in `/cache settings`.
 
 ### `/cache`
 

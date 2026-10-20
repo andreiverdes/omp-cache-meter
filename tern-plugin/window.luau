@@ -58,6 +58,14 @@ local function clock(sec)
 	return string.format("%d:%02d", sec // 60, sec % 60)
 end
 
+-- A past span: `4:12` under an hour, then `3h 05m`, then `2d 4h` (same as the omp meter).
+local function elapsed(sec)
+	sec = math.max(0, math.floor(sec))
+	if sec < 3600 then return clock(sec) end
+	if sec < 86400 then return string.format("%dh %02dm", sec // 3600, (sec % 3600) // 60) end
+	return string.format("%dd %dh", sec // 86400, (sec % 86400) // 3600)
+end
+
 local function tokens(n)
 	if n >= 1e6 then return string.format("%.2fM", n / 1e6) end
 	if n >= 1e3 then return string.format("%.1fk", n / 1e3) end
@@ -183,7 +191,7 @@ local function main_view()
 				string.format("%.1f%%", s.last.hitPct),
 				tokens(s.prefixTokens),
 				if st == "cold"
-					then ui.span("cold " .. clock(-left / 1000) .. " ago", "error")
+					then ui.span("cold " .. elapsed(-left / 1000) .. " ago", "error")
 					elseif st == "compacted" then ui.span("reset by /compact", "accent")
 					else { meter = { value = left / s.ttlMs, tone = TONE[st] } },
 				ui.span(if st == "cold" or st == "compacted" then "" else clock(left / 1000) .. " · " .. s.tierLabel, "muted"),
