@@ -5,7 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import type { ExtensionAPI, ExtensionContext, ExtensionUI, Model, Tui } from "./host";
-import { type Env, type Line, type Retention, renderMeter, renderPanel, requestedTier, snapshot, stageTone, type Tone, Tracker, toAnsi, toTsp, type WarmingMode } from "./meter";
+import { type Env, type Retention, renderMeter, renderPanel, requestedTier, snapshot, Tracker, type WarmingMode } from "./meter";
+import { toAnsi, toTsp, type View } from "./view";
 import { ADVICE_RULE, DEFAULTS, loadSettings, METER_SHOW, METER_SIZE, type MeterSettings, SETTINGS_FILE, saveSettings, TERN_PUBLISH } from "./settings";
 
 const PANE = process.env.TERN_PANE;
@@ -98,24 +99,18 @@ export default function cacheMeter(pi: ExtensionAPI): void {
 		const show = settings.meter.show;
 		const want = s !== undefined && show !== "off" && !(show === "near-expiry" && (s.stage === "warm" || s.stage === "compacted"));
 		if (want && !meterShown) {
-			// Lines are rebuilt on every paint so the countdown moves; describe() feeds native hosts (Tern).
-			const lines = (): { lines: Line[]; tone: Tone } => {
+			// The view is rebuilt on every paint so the countdown moves; describe() feeds native hosts (Tern).
+			const view = (): View => {
 				const now = snapshot(tracker, env());
-				return now ? { lines: renderMeter(now, settings), tone: stageTone(now.stage) } : { lines: [], tone: "muted" };
+				return now ? renderMeter(now, settings) : { tone: "muted", blocks: [] };
 			};
 			ui.setWidget(
 				"cache-meter",
 				(t, theme) => {
 					tui = t;
 					return {
-						render: width => {
-							const m = lines();
-							return toAnsi(m.lines, theme, width, m.tone);
-						},
-						describe: () => {
-							const m = lines();
-							return toTsp(m.lines, "omp.widget.cache-meter", m.tone);
-						},
+						render: width => toAnsi(view(), theme, width),
+						describe: () => toTsp(view(), "omp.widget.cache-meter"),
 						invalidate() {},
 					};
 				},
@@ -128,15 +123,15 @@ export default function cacheMeter(pi: ExtensionAPI): void {
 	};
 
 	const showPanel = (): void => {
-		const lines = () => renderPanel(tracker, snapshot(tracker, env()), model, env().warmingMode);
+		const view = () => renderPanel(tracker, snapshot(tracker, env()), model, env().warmingMode);
 		ui?.setWidget(
 			"cache-panel",
 			panelOpen
 				? (t, theme) => {
 						tui = t;
 						return {
-							render: width => toAnsi(lines(), theme, width, "accent"),
-							describe: () => toTsp(lines(), "omp.widget.cache-panel", "accent"),
+							render: width => toAnsi(view(), theme, width),
+							describe: () => toTsp(view(), "omp.widget.cache-panel"),
 							invalidate() {},
 						};
 					}

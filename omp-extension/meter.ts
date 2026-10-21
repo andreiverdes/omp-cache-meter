@@ -1,5 +1,6 @@
-import type { Model, Theme, Usage } from "./host";
+import type { Model, Usage } from "./host";
 import type { MeterSettings } from "./settings";
+import type { Block, Cell, Item, Span, Tone, View } from "./view";
 
 export type Tier = "short" | "long";
 export type WarmingMode = "off" | "streaming" | "idle";
@@ -211,18 +212,9 @@ export function snapshot(t: Tracker, env: Env): Snapshot | undefined {
 	};
 }
 
-// ── formatting ─────────────────────────────────────────────────────────────
-// Renderers build Lines of Spans once; toAnsi paints them for the terminal TUI with the omp theme, toTsp
-// describes them for native hosts such as Tern, which paint them with their own theme.
-
-export type Tone = "success" | "warning" | "error" | "accent" | "muted" | "strong";
-export interface Span {
-	text: string;
-	tone?: Tone;
-}
-/** Spans kept together; when a line is too wide, whole trailing groups are dropped. */
-export type Group = Span[];
-export type Line = Group[];
+// ── views ──────────────────────────────────────────────────────────────────
+// Renderers build a View (view.ts) once; toAnsi pads it for the terminal TUI, toTsp describes it for native
+// hosts such as Tern.
 
 export function tokens(n: number): string {
 	if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
@@ -243,102 +235,107 @@ export function elapsed(seconds: number): string {
 	return `${Math.floor(s / 86_400)}d ${Math.floor((s % 86_400) / 3600)}h`;
 }
 
-const GAP = "   "; // between groups on a line
-
-/**
- * A thin stacked bar of `cells` cells; parts are [fraction, tone]; the rest is a muted track. Line glyphs
- * keep stacked rows from merging into one block, unlike full blocks.
- */
-function bar(cells: number, parts: [number, Tone][]): Group {
-	const out: Group = [];
-	let used = 0;
-	for (const [frac, tone] of parts) {
-		const n = Math.min(cells - used, Math.round(frac * cells));
-		if (n > 0) out.push({ text: "━".repeat(n), tone });
-		used += n;
-	}
-	if (cells > used) out.push({ text: "─".repeat(cells - used), tone: "muted" });
-	return out;
-}
-
-/** The colour of a stage: the meter's edge, countdown and advice. */
+/** The colour of a stage: the meter's edge, badge, countdown and advice. */
 export function stageTone(stage: Stage): Tone {
 	return stage === "cold" ? "error" : stage === "expiring" ? "warning" : stage === "compacted" ? "accent" : "success";
 }
 
-/** The 0–3 line meter above the composer; empty when settings hide it now. */
-export function renderMeter(s: Snapshot, settings: MeterSettings): Line[] {
-	const show = settings.meter.show;
-	if (show === "off" || (show === "near-expiry" && (s.stage === "warm" || s.stage === "compacted"))) return [];
-	if (s.cachingOff) return [[[{ text: "prompt caching off · providers.cacheRetention: none", tone: "muted" }]]];
-	const tone = stageTone(s.stage);
-	const left = clock(s.leftMs / 1000);
-	const cost = `$${s.rewriteCost.toFixed(2)}`;
-	const rewrite = `${tokens(s.prefixTokens)} tokens ≈ ${cost}`;
+const STAGE_BADGE: Record<Stage, string> = { warm: "warm", expiring: "expiring", cold: "cold", compacted: "reset by /compact" };
+const muted = (text: string): Span[] => [{ text, tone: "muted" }];
 
-	if (s.compacted) {
-		const after = s.compacted.tokensAfter;
-		if (settings.meter.size === "compact") return [[[{ text: `⛁ cache reset by /compact${after === undefined ? "" : ` · new prefix ≈ ${cost}`}`, tone }], [{ text: "✓ keep going", tone }]]];
-		const sizes = after === undefined ? `was ${tokens(s.compacted.tokensBefore)} tokens` : `${tokens(s.compacted.tokensBefore)} → ${tokens(after)} tokens`;
-		const next: Group = [{ text: "next request writes the new prefix", tone: "muted" }];
-		if (after !== undefined) next.push({ text: " " }, { text: rewrite });
-		return [
-			[[{ text: "⛁ prompt cache reset by /compact", tone }], [{ text: sizes, tone: "muted" }]],
-			[next, [{ text: "✓ keep going", tone: "success" }]],
-		];
-	}
+/**
+ * The meter above the composer: a title bar (stage badge left, what to do right) over a table whose
+ * columns line up labels, values, bars and details. Empty when settings hide it now.
+ */
+export function renderMeter(s: Snapshot, settings: MeterSettings): View {
+	const tone = stageTone(s.stage);
+	const show = settings.meter.show;
+	if (show === "off" || (show === "near-expiry" && (s.stage === "warm" || s.stage === "compacted"))) return { tone, blocks: [] };
+	if (s.cachingOff) return { tone: "muted", blocks: [{ kind: "bar", left: [muted("⛁ prompt caching off")], right: [muted("providers.cacheRetention: none")] }] };
+	const cost = `$${s.rewriteCost.toFixed(2)}`;
+	const title: Item[] = [[{ text: "⛁ prompt cache", tone: "strong" }], { badge: STAGE_BADGE[s.stage], tone }];
+	const keepGoing: Item = [{ text: "✓ keep going", tone: "success" }];
 
 	if (settings.meter.size === "compact") {
-		const head = s.stage === "cold" ? `⛁ cache cold · rewrite ≈ ${cost}` : `⛁ ${s.last.hitPct.toFixed(1)}% hit · ${left}`;
-		const advice = s.advice === "compact" ? "→ /compact" : s.advice === "send now" ? "→ send now" : "✓ keep going";
-		return [[[{ text: head, tone }], [{ text: advice, tone }]]];
-	}
-	if (s.stage === "cold") {
-		// One line per way on, command column aligned, so each choice reads on its own. The padding is
-		// non-breaking because native hosts trim trailing spaces from a text node.
-		const option = (cmd: string, what: string, recommended: boolean): Line => {
-			const line: Line = [[{ text: cmd.padEnd(10, "\u00a0"), tone: "accent" }], [{ text: what, tone: "muted" }]];
-			if (recommended) line.push([{ text: "← recommended", tone: "success" }]);
-			return line;
-		};
-		const compact = s.coldAdvice === "compact";
-		return [
-			[[{ text: "✕ prompt cache cold", tone: "error" }], [{ text: `expired ${elapsed(-s.leftMs / 1000)} ago`, tone: "muted" }]],
-			[[{ text: "your next message re-sends ", tone: "muted" }, { text: rewrite }, { text: " to rebuild it", tone: "muted" }]],
-			option("keep going", `send as usual; pay ${cost} once, then it's cached again`, !compact),
-			option("/compact", "summarise first; later turns send far fewer tokens", compact),
-			option("/new", "fresh session; best when this task is finished", false),
-			[[{ text: `why it went cold: ${s.warming.reason ?? "the cache expired"}`, tone: "muted" }], [{ text: "· /cache settings sets when /compact is recommended", tone: "muted" }]],
-		];
+		const detail =
+			s.stage === "cold" ? `rewrite ≈ ${cost}` : s.stage === "compacted" ? `new prefix ≈ ${cost}` : `${s.last.hitPct.toFixed(1)}% hit · ${clock(s.leftMs / 1000)}`;
+		const advice: Item = s.advice === "compact" ? [{ text: "→ /compact", tone }] : s.advice === "send now" ? [{ text: "→ send now", tone }] : keepGoing;
+		return { tone, blocks: [{ kind: "bar", left: [...title, muted(detail)], right: [advice] }] };
 	}
 
-	const frac = (n: number) => (s.last.total > 0 ? n / s.last.total : 0);
-	const value = (label: string, n: number): Span[] => [{ text: `${label} `, tone: "muted" }, { text: tokens(n) }];
-	const line1: Line = [
-		[{ text: "⛁ prompt cache", tone: "strong" }],
-		[{ text: `${s.last.hitPct.toFixed(1)}% hit`, tone: "success" }],
-		bar(12, [[frac(s.last.read), "success"], [frac(s.last.write), "accent"], [frac(s.last.uncached), "warning"]]),
-		[...value("read", s.last.read), { text: " · ", tone: "muted" }, ...value("write", s.last.write), { text: " · ", tone: "muted" }, ...value("uncached", s.last.uncached)],
-	];
-	const expiring = s.stage === "expiring";
-	const line2: Line = [[{ text: expiring ? "⚠ expires in " : "  expires in ", tone: expiring ? "warning" : "muted" }, { text: left, tone }]];
-	if (settings.meter.countdownBar) line2.push(bar(12, [[Math.max(0, s.leftMs) / s.ttlMs, tone]]));
-	line2.push([{ text: s.tierLabel, tone: "muted" }]);
-	// A planned refresh is worth showing; why a cache won't be warmed only matters once it is about to expire.
-	if (s.warming.scheduled) line2.push([{ text: s.warming.summary, tone: "muted" }]);
-	if (!expiring) line2.push([{ text: "✓ keep going", tone: "success" }]);
-	const lines = [line1, line2];
-	if (expiring) {
-		lines.push([[{ text: "→ send now to keep it", tone: "warning" }], [{ text: "or the next turn rewrites ", tone: "muted" }, { text: rewrite }], [{ text: s.warming.summary, tone: "muted" }]]);
+	if (s.compacted) {
+		const { tokensBefore, tokensAfter } = s.compacted;
+		return {
+			tone,
+			blocks: [
+				{ kind: "bar", left: title, right: [keepGoing] },
+				{
+					kind: "table",
+					cols: [{}, { align: "end" }, { grow: true, priority: -1 }],
+					rows: [
+						tokensAfter === undefined
+							? [muted("conversation"), [{ text: tokens(tokensBefore) }], muted("tokens before the summary")]
+							: [muted("conversation"), [{ text: `${tokens(tokensBefore)} → ${tokens(tokensAfter)}` }], muted("tokens before → after the summary")],
+						[muted("next request"), [{ text: tokensAfter === undefined ? "–" : `≈ ${cost}` }], muted("writes the new prefix to the cache")],
+					],
+				},
+			],
+		};
 	}
-	return lines;
+
+	if (s.stage === "cold") {
+		const compact = s.coldAdvice === "compact";
+		const recommended: Span[] = [{ text: "✓ recommended", tone: "success" }];
+		return {
+			tone,
+			blocks: [
+				{
+					kind: "bar",
+					left: [...title, muted(`expired ${elapsed(-s.leftMs / 1000)} ago`)],
+					right: [[{ text: "next message re-sends ", tone: "muted" }, { text: `${tokens(s.prefixTokens)} tokens` }, { text: " ≈ ", tone: "muted" }, { text: cost, tone: "warning" }]],
+				},
+				{
+					kind: "table",
+					cols: [{}, { grow: true }, { align: "end" }],
+					rows: [
+						[[{ text: "keep going", tone: "accent" }], muted(`send as usual; pays ${cost} once, then it's cached again`), compact ? [] : recommended],
+						[[{ text: "/compact", tone: "accent" }], muted("summarise first; later turns send far fewer tokens"), compact ? recommended : []],
+						[[{ text: "/new", tone: "accent" }], muted("fresh session; best when this task is finished"), []],
+					],
+				},
+				{ kind: "bar", left: [muted(`why: ${s.warming.reason ?? "the cache expired"}`)], right: [muted("/cache settings")] },
+			],
+		};
+	}
+
+	const expiring = s.stage === "expiring";
+	const total = s.last.total || 1;
+	// A planned refresh is worth showing; why a cache won't be warmed only matters once it is about to expire.
+	const lifetime = s.warming.scheduled || expiring ? `${s.tierLabel} · ${s.warming.summary}` : s.tierLabel;
+	const rows: Cell[][] = [
+		[
+			muted("last request"),
+			[{ text: `${s.last.hitPct.toFixed(1)}% hit`, tone: "success" }],
+			{ bar: [[s.last.read / total, "success"], [s.last.write / total, "accent"], [s.last.uncached / total, "warning"]] },
+			[...muted("read "), { text: tokens(s.last.read) }, ...muted("  write "), { text: tokens(s.last.write) }, ...muted("  uncached "), { text: tokens(s.last.uncached) }],
+		],
+		[muted("expires in"), [{ text: clock(s.leftMs / 1000), tone }], settings.meter.countdownBar ? { bar: [[Math.max(0, s.leftMs) / s.ttlMs, tone]] } : [], muted(lifetime)],
+	];
+	if (expiring) rows.push([muted("if it expires"), [{ text: cost, tone: "warning" }], [], muted(`the next turn rewrites ${tokens(s.prefixTokens)} tokens`)]);
+	return {
+		tone,
+		blocks: [
+			{ kind: "bar", left: title, right: [expiring ? [{ text: "→ send now to keep it", tone: "warning" }] : keepGoing] },
+			{ kind: "table", cols: [{}, { align: "end" }, {}, { grow: true, priority: -1 }], rows },
+		],
+	};
 }
 
-/** The `/cache` panel: session totals and the latest requests, in blank-line separated sections. */
-export function renderPanel(t: Tracker, s: Snapshot | undefined, model: Model | undefined, mode: WarmingMode): Line[] {
+/** The `/cache` panel: a title bar, session totals and the latest requests as tables, and the commands. */
+export function renderPanel(t: Tracker, s: Snapshot | undefined, model: Model | undefined, mode: WarmingMode): View {
 	const about = [model ? `${model.provider} · ${model.id}` : undefined, s?.tierLabel, `warming ${mode}`].filter(Boolean).join(" · ");
-	const header: Line = [[{ text: "⛁ Prompt cache · this session", tone: "strong" }], [{ text: about, tone: "muted" }]];
-	if (!s) return [header, [], [[{ text: "No requests yet.", tone: "muted" }]]];
+	const header: Block = { kind: "bar", left: [[{ text: "⛁ Prompt cache · this session", tone: "strong" }]], right: [muted(about)] };
+	if (!s) return { tone: "accent", blocks: [header, { kind: "gap" }, { kind: "bar", left: [muted("No requests yet.")], right: [] }] };
 	let read = 0;
 	let all = 0;
 	for (const r of t.history) {
@@ -346,82 +343,41 @@ export function renderPanel(t: Tracker, s: Snapshot | undefined, model: Model | 
 		all += r.read + r.write + r.uncached;
 	}
 	const k = t.totals;
-	const kpis: Line = [
-		[{ text: `${all > 0 ? ((100 * read) / all).toFixed(1) : "0.0"}%`, tone: "success" }, { text: " session hit", tone: "muted" }],
-		[{ text: `$${k.saved.toFixed(2)}` }, { text: " saved by the cache", tone: "muted" }],
-		[{ text: `$${k.warmCost.toFixed(2)}` }, { text: ` warming · ${k.warms} refreshes`, tone: "muted" }],
-		[{ text: String(k.misses), tone: k.misses > 0 ? "warning" : undefined }, { text: ` misses · $${k.missCost.toFixed(2)} rewrites`, tone: "muted" }],
-	];
-	const col = (text: string, width: number, right = true): Span => ({ text: right ? text.padStart(width) : text.padEnd(width) });
-	const rows: Line[] = [
-		[[{ text: `${"time".padEnd(10)}${"request".padEnd(11)}${"split".padEnd(12)}${"read".padStart(9)}${"write".padStart(9)}${"uncached".padStart(10)}${"hit".padStart(8)}${"cost".padStart(9)}`, tone: "muted" }]],
-	];
-	const recent = t.history.slice(-8);
-	let turn = t.history.filter(r => r.kind === "turn").length - recent.filter(r => r.kind === "turn").length;
-	for (const [i, r] of recent.entries()) {
-		const total = r.read + r.write + r.uncached;
-		const miss = !r.afterCompact && (i > 0 || t.history.length > recent.length) && r.read === 0 && r.write > 0;
-		const row: Group = [
-			col(new Date(r.at).toTimeString().slice(0, 8), 10, false),
-			r.kind === "warm" ? { text: "warm".padEnd(11), tone: "accent" } : col(`turn ${++turn}`, 11, false),
-			...bar(10, [[r.read / total, "success"], [r.write / total, "accent"], [r.uncached / total, "warning"]]),
-			{ text: "  " },
-			col(tokens(r.read), 9),
-			col(tokens(r.write), 9),
-			col(tokens(r.uncached), 10),
-			{ text: `${((100 * r.read) / total).toFixed(1)}%`.padStart(8), tone: r.read / total >= 0.9 ? undefined : "warning" },
-			col(`$${r.cost.toFixed(2)}`, 9),
-		];
-		if (r.afterCompact) row.push({ text: "   after /compact", tone: "accent" });
-		else if (miss) row.push({ text: "   miss", tone: "error" });
-		rows.push([row]);
-	}
-	const footer: Line = ["/cache closes", "/cache settings", "/compact", "/new"].map(text => [{ text, tone: "muted" }]);
-	return [header, [], kpis, [], ...rows, [], footer];
-}
-
-/**
- * Paints lines for the terminal: an edge mark and a space, whole groups while they fit `width`, and a
- * blank row after the block so it doesn't touch the composer.
- */
-export function toAnsi(lines: Line[], theme: Theme, width: number, edgeTone: Tone): string[] {
-	if (lines.length === 0) return [];
-	const edge = theme.fg(edgeTone === "strong" ? "accent" : edgeTone, "▌");
-	const painted = lines.map(line => {
-		let out = `${edge} `;
-		let used = 2;
-		for (const [i, group] of line.entries()) {
-			const len = group.reduce((n, sp) => n + sp.text.length, 0) + (i > 0 ? GAP.length : 0);
-			if (used + len > width) break;
-			out += (i > 0 ? GAP : "") + group.map(sp => (sp.tone && sp.tone !== "strong" ? theme.fg(sp.tone, sp.text) : sp.text)).join("");
-			used += len;
-		}
-		return out;
-	});
-	return [...painted, ""];
-}
-
-/**
- * A native-surface node for the same lines (the `{k, p, c, key}` wire format omp's describe() uses). Each
- * line is a row of its groups, so a narrow pane wraps between groups instead of inside one.
- */
-export function toTsp(lines: Line[], role: string, edgeTone: Tone): unknown {
-	const span = (sp: Span) => (sp.tone ? { t: sp.text, s: sp.tone } : { t: sp.text });
-	return {
-		k: "col",
-		p: { role, gap: "xs", tone: edgeTone === "strong" ? "accent" : edgeTone },
-		c: [
-			...lines.map((line, i) =>
-				line.length === 0
-					? { k: "text", p: { text: " " }, key: `l${i}` }
-					: {
-							k: "row",
-							p: { gap: "md", wrap: true, align: "center" },
-							c: line.map((group, g) => ({ k: "text", p: { spans: group.map(span) }, key: `g${g}` })),
-							key: `l${i}`,
-						},
-			),
-			{ k: "text", p: { text: " " }, key: "pad" },
+	const kpis: Block = {
+		kind: "table",
+		cols: [{ head: "session hit" }, { head: "saved by the cache" }, { head: "warming", priority: -2 }, { head: "misses", priority: -1 }],
+		rows: [
+			[
+				[{ text: `${all > 0 ? ((100 * read) / all).toFixed(1) : "0.0"}%`, tone: "success" }],
+				[{ text: `$${k.saved.toFixed(2)}` }],
+				[{ text: `$${k.warmCost.toFixed(2)}` }, ...muted(` · ${k.warms} ${k.warms === 1 ? "refresh" : "refreshes"}`)],
+				[{ text: String(k.misses), tone: k.misses > 0 ? "warning" : undefined }, ...muted(` · $${k.missCost.toFixed(2)} rewrites`)],
+			],
 		],
 	};
+	const recent = t.history.slice(-8);
+	let turn = t.history.filter(r => r.kind === "turn").length - recent.filter(r => r.kind === "turn").length;
+	const rows: Cell[][] = recent.map((r, i) => {
+		const total = r.read + r.write + r.uncached;
+		const miss = !r.afterCompact && (i > 0 || t.history.length > recent.length) && r.read === 0 && r.write > 0;
+		return [
+			muted(new Date(r.at).toTimeString().slice(0, 8)),
+			r.kind === "warm" ? [{ text: "warm", tone: "accent" }] : [{ text: `turn ${++turn}` }],
+			{ bar: [[r.read / total, "success"], [r.write / total, "accent"], [r.uncached / total, "warning"]] },
+			[{ text: tokens(r.read) }],
+			[{ text: tokens(r.write) }],
+			[{ text: tokens(r.uncached) }],
+			[{ text: `${((100 * r.read) / total).toFixed(1)}%`, tone: r.read / total >= 0.9 ? undefined : "warning" }],
+			[{ text: `$${r.cost.toFixed(2)}` }],
+			r.afterCompact ? [{ text: "after /compact", tone: "accent" }] : miss ? [{ text: "miss", tone: "error" }] : [],
+		];
+	});
+	const end = { align: "end" } as const;
+	const requests: Block = {
+		kind: "table",
+		cols: [{ head: "time" }, { head: "request" }, { head: "split", priority: -1 }, { head: "read", ...end }, { head: "write", ...end }, { head: "uncached", ...end, priority: -2 }, { head: "hit", ...end }, { head: "cost", ...end }, { head: "" }],
+		rows,
+	};
+	const footer: Block = { kind: "bar", left: ["/cache closes", "/cache settings", "/compact", "/new"].map(text => muted(text)), right: [] };
+	return { tone: "accent", blocks: [header, { kind: "gap" }, kpis, { kind: "gap" }, requests, { kind: "gap" }, footer] };
 }

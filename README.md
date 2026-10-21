@@ -4,7 +4,7 @@ A prompt-cache meter for [omp](https://github.com/can1357/oh-my-pi). It shows ho
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/omp-meter-warm-light.png">
-  <img alt="The meter above omp's composer: 99.5% hit, read 31.0k · write 144 · uncached 10, expires in 4:33, 5m tier, warming at 0:30 left, keep going" src="docs/screenshots/omp-meter-warm.png">
+  <img alt="The meter above omp's composer: a 'prompt cache' title with a green 'warm' badge and 'keep going' on the right, over a table: last request 98.8% hit with its split bar and read/write/uncached counts, and expires in 4:56 with a countdown bar, 5m tier, warming at 0:30 left" src="docs/screenshots/omp-meter-warm.png">
 </picture>
 
 The repo has two parts:
@@ -44,14 +44,17 @@ The meter sits above the composer and redraws every second. Its colour and text 
 | Cold | The cache entry has expired | How long ago, what your next message re-sends and costs, one line per way on (below), and why it went cold |
 | Reset by `/compact` | A compaction (manual or automatic) is newer than the last request | Tokens before → after, what the next request writes for the new prefix, `✓ keep going` |
 
-![The meter on an expiring cache: send now to keep it, or the next turn rewrites the prefix](docs/screenshots/omp-meter-expiring.png)
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/omp-meter-expiring-light.png">
+  <img alt="The meter on an expiring cache: an 'expiring' badge and 'send now to keep it' on the right, 0:26 left on a nearly empty bar, why omp won't refresh it, and what the next turn rewrites if it expires" src="docs/screenshots/omp-meter-expiring.png">
+</picture>
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/omp-meter-cold-light.png">
-  <img alt="The meter on a cold cache: expired 1:44 ago, the rewrite cost, then keep going, /compact (recommended) and /new on separate lines with what each does, and why it went cold" src="docs/screenshots/omp-meter-cold.png">
+  <img alt="The meter on a cold cache: a 'cold' badge, expired 0:23 ago, and what the next message re-sends on the right, then a table of keep going, /compact (recommended) and /new with what each does, and why it went cold" src="docs/screenshots/omp-meter-cold.png">
 </picture>
 
-(For the cold screenshot the token threshold was lowered to 20,000 so the 30.7k-token demo prefix passes it.)
+(For the cold screenshot the token threshold was lowered to 20,000 so the 31.1k-token demo prefix passes it.)
 
 On a cold cache your next message has to re-send the whole conversation to rebuild the cache. The meter lists three ways on, one per line, and marks one as recommended:
 
@@ -69,7 +72,7 @@ On a cold cache your next message has to re-send the whole conversation to rebui
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/omp-cache-panel-light.png">
-  <img alt="The /cache panel: session hit, saved, warming, misses, and a table of the last requests" src="docs/screenshots/omp-cache-panel.png">
+  <img alt="The /cache panel: a title bar with the model and tier, a table of session hit, savings, warming and misses, and a table of the last requests with split bars and right-aligned token counts" src="docs/screenshots/omp-cache-panel.png">
 </picture>
 
 ### `/cache settings`
@@ -108,7 +111,7 @@ All colours come from the active omp or Tern theme, so light and dark themes bot
 - **Cache lifetime:** the tier comes from the `cache_control.ttl` on the request omp sends (`before_provider_request`), confirmed by Anthropic's cache-write split in the usage. The lifetime of that tier comes from the model's `promptCache` entry in omp's catalog.
 - **Warming:** omp doesn't expose its warmer's state to extensions, so the extension mirrors omp's rules from `cache-warmer.ts`. A refresh is scheduled at 90% of the lifetime and at least 10 s before expiry. Idle warming stops 30 minutes after the last request, so it covers 5m entries only. Any `cache_warming_decision` and `cache_warming_end` events refine that.
 - **State file:** the interactive session writes `<Tern config>/plugin-data/cache-meter/panes/<TERN_PANE>.json` atomically whenever its contents change, and deletes it on exit. Subagent and print-mode sessions have no UI and never write it.
-- **Rendering:** the meter is built once as lines of spans. In a terminal those lines are painted with the omp theme's ANSI colours. In Tern they go out as native nodes through `describe()`, and narrow panes wrap between items.
+- **Rendering:** the meter and panel are built once as a small layout (title bars with a stage badge and right-aligned advice, and tables with aligned columns and inline bars). In Tern it goes out through `describe()` as native rows, badges and tables, so columns line up and low-priority columns hide in narrow panes. In other terminals the same layout is padded into aligned columns with the omp theme's ANSI colours.
 
 ## Limitations
 
